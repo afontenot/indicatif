@@ -409,6 +409,9 @@ pub(crate) struct Estimator {
     prev_steps: u64,
     prev_time: Instant,
     start_time: Instant,
+    max_delta: f64,
+    min_delta: f64,
+    num_updates: u64,
 }
 
 impl Estimator {
@@ -419,6 +422,9 @@ impl Estimator {
             prev_steps: 0,
             prev_time: now,
             start_time: now,
+            max_delta: 0.0,
+            min_delta: std::f64::INFINITY,
+            num_updates: 0,
         }
     }
 
@@ -434,14 +440,22 @@ impl Estimator {
             return;
         }
 
+        self.num_updates += 1;
         let delta_steps = new_steps - self.prev_steps;
         let delta_t = duration_to_secs(now - self.prev_time);
+
+        if self.max_delta < delta_t {
+            self.max_delta = delta_t;
+        }
+        if self.min_delta > delta_t {
+            self.min_delta = delta_t;
+        }
 
         // the rate of steps we saw in this update
         let new_steps_per_second = delta_steps as f64 / delta_t;
 
         // update the estimate: a weighted average of the old estimate and new data
-        let weight = estimator_weight(delta_t);
+        let weight = self.estimator_weight(delta_t);
         self.smoothed_steps_per_sec =
             self.smoothed_steps_per_sec * weight + new_steps_per_second * (1.0 - weight);
 
@@ -452,7 +466,7 @@ impl Estimator {
         // a source for the double smoothed estimate. See comment on normalization in
         // `steps_per_second` for details.
         let delta_t_start = duration_to_secs(now - self.start_time);
-        let total_weight = 1.0 - estimator_weight(delta_t_start);
+        let total_weight = 1.0 - self.estimator_weight(delta_t_start);
         let normalized_smoothed_steps_per_sec = self.smoothed_steps_per_sec / total_weight;
 
         // determine the double smoothed value (EWA smoothing of the single EWA)
@@ -481,7 +495,7 @@ impl Estimator {
         // we determine how much time has passed since the last update, and treat this as a
         // pseudo-update with 0 steps.
         let delta_t = duration_to_secs(now - self.prev_time);
-        let reweight = estimator_weight(delta_t);
+        let reweight = self.estimator_weight(delta_t);
 
         // Normalization of estimates:
         //
@@ -503,7 +517,7 @@ impl Estimator {
         // in the weighted average. This sum is just W(0) - W(t_f), where t_f is the time since the
         // first sample, and W(0) = 1.
         let delta_t_start = duration_to_secs(now - self.start_time);
-        let total_weight = 1.0 - estimator_weight(delta_t_start);
+        let total_weight = 1.0 - self.estimator_weight(delta_t_start);
 
         // Generate updated values for `smoothed_steps_per_sec` and `double_smoothed_steps_per_sec`
         // (sps and dsps) without storing them. Note that we normalize sps when using it as a
@@ -511,6 +525,45 @@ impl Estimator {
         let sps = self.smoothed_steps_per_sec * reweight / total_weight;
         let dsps = self.double_smoothed_steps_per_sec * reweight + sps * (1.0 - reweight);
         dsps / total_weight
+    }
+
+    /// Get the appropriate dilution weight for Estimator data given the data's age (in seconds)
+    ///
+    /// Whenever an update occurs, we will create a new estimate using a weight `w_i` like so:
+    ///
+    /// ```math
+    /// <new estimate> = <previous estimate> * w_i + <new data> * (1 - w_i)
+    /// ```
+    ///
+    /// In other words, the new estimate is a weighted average of the previous estimate and the new
+    /// data. We want to choose weights such that for any set of samples where `t_0, t_1, ...` are
+    /// the durations of the samples:
+    ///
+    /// ```math
+    /// Sum(t_i) = ews ==> Prod(w_i) = 0.1
+    /// ```
+    ///
+    /// With this constraint it is easy to show that
+    ///
+    /// ```math
+    /// w_i = 0.1 ^ (t_i / ews)
+    /// ```
+    ///
+    /// Notice that the constraint implies that estimates are independent of the durations of the
+    /// samples, a very useful feature.
+    fn estimator_weight(&self, age: f64) -> f64 {
+        const EXPONENTIAL_WEIGHTING_SECONDS: f64 = 15.0;
+
+        // Avoid treating long delays as stalls by making the weight dynamically increase to a
+        // multiple (6.6x) of the estimated maximum delay between updates.
+        let mut max_delta_est = 6.6 * self.max_delta;
+        if self.num_updates > 1 {
+            max_delta_est = 6.6 * (self.num_updates as f64 * self.max_delta - self.min_delta)
+                / (self.num_updates - 1) as f64;
+        }
+        let weighting = EXPONENTIAL_WEIGHTING_SECONDS.max(max_delta_est);
+
+        0.1_f64.powf(age / weighting)
     }
 }
 
@@ -620,35 +673,6 @@ impl Default for ProgressFinish {
     fn default() -> Self {
         Self::AndClear
     }
-}
-
-/// Get the appropriate dilution weight for Estimator data given the data's age (in seconds)
-///
-/// Whenever an update occurs, we will create a new estimate using a weight `w_i` like so:
-///
-/// ```math
-/// <new estimate> = <previous estimate> * w_i + <new data> * (1 - w_i)
-/// ```
-///
-/// In other words, the new estimate is a weighted average of the previous estimate and the new
-/// data. We want to choose weights such that for any set of samples where `t_0, t_1, ...` are
-/// the durations of the samples:
-///
-/// ```math
-/// Sum(t_i) = ews ==> Prod(w_i) = 0.1
-/// ```
-///
-/// With this constraint it is easy to show that
-///
-/// ```math
-/// w_i = 0.1 ^ (t_i / ews)
-/// ```
-///
-/// Notice that the constraint implies that estimates are independent of the durations of the
-/// samples, a very useful feature.
-fn estimator_weight(age: f64) -> f64 {
-    const EXPONENTIAL_WEIGHTING_SECONDS: f64 = 15.0;
-    0.1_f64.powf(age / EXPONENTIAL_WEIGHTING_SECONDS)
 }
 
 fn duration_to_secs(d: Duration) -> f64 {
